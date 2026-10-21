@@ -218,6 +218,11 @@ opengauss = [
   "psycopg2-binary>=2.9,<3",
 ]
 
+valkey = [
+  # Synchronous client for Valkey Search (valkey-search >= 1.2.1).
+  "redis>=5.0,<7",
+]
+
 [project.urls]
 Homepage = "https://github.com/volcengine/openviking"
 Documentation = "https://openviking.ai"

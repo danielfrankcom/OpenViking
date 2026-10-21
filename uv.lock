@@ -3705,6 +3705,9 @@ test = [
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
+valkey = [
+    { name = "redis" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -3815,6 +3818,7 @@ requires-dist = [
     { name = "redis", marker = "extra == 'expiry'", specifier = ">=5,<7" },
     { name = "redis", marker = "extra == 'redis-mysql'", specifier = ">=5.0,<7" },
     { name = "redis", marker = "extra == 'test'", specifier = ">=5.0,<7" },
+    { name = "redis", marker = "extra == 'valkey'", specifier = ">=5.0,<7" },
     { name = "requests", specifier = ">=2.33.0" },
     { name = "rich", marker = "extra == 'bot'", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
@@ -3857,7 +3861,7 @@ requires-dist = [
     { name = "wheel", marker = "extra == 'build'" },
     { name = "xxhash", specifier = ">=3.0.0" },
 ]
-provides-extras = ["expiry", "gateway-fast", "mysql", "redis-mysql", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
+provides-extras = ["expiry", "gateway-fast", "mysql", "redis-mysql", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss", "valkey"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.2" }]
