@@ -496,7 +496,7 @@ class CollectionAdapter(ABC):
 
             protection = decay_request["protection"]
             origin = parse_iso_datetime(decay_request["origin"])
-            if self.mode in {"local", "cuvs", "http"}:
+            if self.mode in {"local", "cuvs", "http", "valkey"}:
                 spec = build_time_decay_fusion_spec(protection=protection, origin=origin)
                 advance = {
                     "time_decay": {
