@@ -1016,6 +1016,21 @@ def test_opengauss_backend_is_accepted_with_defaults():
     assert config.opengauss.mode == "standalone"
 
 
+def test_valkey_backend_is_accepted_with_defaults():
+    config = VectorDBBackendConfig(backend="valkey")
+    assert config.valkey is not None
+    assert (config.valkey.mode, config.valkey.endpoints) == (
+        "standalone",
+        ["redis://127.0.0.1:6379"],
+    )
+    assert config.valkey.index_type == "flat"
+
+
+def test_valkey_backend_rejects_sparse_weight():
+    with pytest.raises(ValueError, match="dense-only"):
+        VectorDBBackendConfig(backend="valkey", sparse_weight=0.3)
+
+
 def test_opengauss_backend_requires_host():
     from openviking_cli.utils.config.vectordb_config import OpenGaussConfig
 

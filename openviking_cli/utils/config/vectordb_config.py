@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 from typing import Any, Dict, Literal, Optional
 
-from pydantic import BaseModel, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
+from openviking_cli.utils.config.agfs_config import RedisCacheConfig
 from openviking_cli.utils.logger import get_logger
 
 COLLECTION_NAME = "context"
@@ -256,6 +257,29 @@ class OpenGaussConfig(OpenGaussIndexConfig):
         return self
 
 
+class ValkeyConfig(RedisCacheConfig):
+    """Configuration for the Valkey Search vector backend.
+
+    The connection fields are RedisCacheConfig's, so a Valkey deployment is described
+    and validated the same way as the cache used by RAGFS and the account store.
+    ``default_ttl_seconds`` is a cache setting and does not apply to vector records.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Searches and index backfills run on the server; the 20 ms cache default would
+    # time them out.
+    command_timeout_ms: int = Field(default=5000, description="Valkey command timeout")
+    index_type: Literal["flat", "hnsw"] = Field(
+        default="flat",
+        description="FT.CREATE vector algorithm. FLAT is exact, like the local backend.",
+    )
+    vector_index_params: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Extra FT.CREATE vector attributes, e.g. {'M': 16, 'EF_RUNTIME': 100}.",
+    )
+
+
 class CuVSConfig(BaseModel):
     """Configuration for GPU dense-vector search through NVIDIA cuVS."""
 
@@ -405,7 +429,7 @@ class VectorDBBackendConfig(BaseModel):
         description=(
             "VectorDB backend type: 'local', 'cuvs', 'http', "
             "'volcengine' (AK/SK signed or API key data-plane only), "
-            "'vikingdb' (private deployment), or 'opengauss'"
+            "'vikingdb' (private deployment), 'opengauss', or 'valkey'"
         ),
     )
 
@@ -469,6 +493,11 @@ class VectorDBBackendConfig(BaseModel):
         description="openGauss DataVec configuration for the 'opengauss' backend",
     )
 
+    valkey: Optional[ValkeyConfig] = Field(
+        default_factory=ValkeyConfig,
+        description="Valkey Search configuration for the 'valkey' backend",
+    )
+
     custom_params: Dict[str, Any] = Field(
         default_factory=dict,
         description="Custom parameters for custom backend adapters",
@@ -484,6 +513,7 @@ class VectorDBBackendConfig(BaseModel):
             "volcengine",
             "vikingdb",
             "opengauss",
+            "valkey",
         ]
 
         # Allow custom backend classes (containing dot) without standard validation
@@ -550,6 +580,15 @@ class VectorDBBackendConfig(BaseModel):
             self.opengauss.validate_capabilities(
                 distributed=self.opengauss.is_distributed, distance=distance
             )
+
+        elif self.backend == "valkey":
+            if not self.valkey:
+                raise ValueError("VectorDB valkey backend requires 'valkey' config")
+            if self.sparse_weight > 0.0:
+                raise ValueError(
+                    "VectorDB valkey backend is dense-only (Valkey Search has no sparse "
+                    "vector type); set sparse_weight to 0"
+                )
 
         return self
 
