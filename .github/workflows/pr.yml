@@ -139,6 +139,7 @@ jobs:
     outputs:
       deps_changed: ${{ steps.check.outputs.deps_changed }}
       cuvs_changed: ${{ steps.check.outputs.cuvs_changed }}
+      valkey_changed: ${{ steps.check.outputs.valkey_changed }}
       langchain_changed: ${{ steps.check.outputs.langchain_changed }}
       openclaw_changed: ${{ steps.check.outputs.openclaw_changed }}
       sdk_python_changed: ${{ steps.check.outputs.sdk_python_changed }}
@@ -179,6 +180,20 @@ jobs:
           else
             echo "No cuVS-related changes detected."
             echo "cuvs_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Run the Valkey Search backend suite when the backend, the adapter and
+          # collection contracts it implements, its config or its tests change.
+          VALKEY_PATTERN="openviking/storage/vectordb_adapters/(base|factory|valkey_adapter)\.py|openviking/storage/vectordb_adapters/valkey/|openviking/storage/vectordb/|openviking/storage/expr\.py|openviking_cli/utils/config/(vectordb|agfs)_config\.py|tests/vectordb/valkey_backend/|\.github/workflows/pr\.yml"
+          VALKEY_CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD | grep -E "$VALKEY_PATTERN" || true)
+
+          if [ -n "$VALKEY_CHANGED_FILES" ]; then
+            echo "Valkey backend-related changes detected:"
+            echo "$VALKEY_CHANGED_FILES"
+            echo "valkey_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No Valkey backend-related changes detected."
+            echo "valkey_changed=false" >> $GITHUB_OUTPUT
           fi
 
           LANGCHAIN_PATTERN="integrations/frameworks/langchain/|^openviking/integrations/|^tests/unit/test_langchain_[^/]*\.py$|^tests/integration/langchain_langgraph/|^examples/(langchain|langchain-langgraph|agent-framework)/|^pyproject\.toml$|^uv\.lock$|\.github/workflows/(pr|python-langchain-release)\.yml"
@@ -267,6 +282,61 @@ jobs:
     with:
       os_json: '["ubuntu-24.04"]'
       python_json: '["3.11"]'
+
+  valkey-tests:
+    needs: check-deps
+    if: ${{ needs.check-deps.outputs.valkey_changed == 'true' }}
+    runs-on: ubuntu-24.04
+    services:
+      valkey:
+        # Ships Valkey Search 1.2.1, the oldest version the backend supports.
+        image: valkey/valkey-bundle:9.1.3
+        env:
+          # OpenViking reads whole collections with a 100000-NN query; the default
+          # cap is 10000.
+          VALKEY_EXTRA_FLAGS: --search.max-vector-knn 100000
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Install Python dependencies
+        run: uv sync --frozen --extra test --extra valkey
+
+      - name: Install build dependencies
+        run: uv pip install setuptools setuptools_scm cmake wheel
+
+      # The differential tests compare Valkey with the local engine, a C++ extension.
+      - name: Build C++ extensions
+        run: uv run python setup.py build_ext --inplace
+
+      - name: Run Valkey Search backend tests
+        env:
+          OPENVIKING_VALKEY_TEST_URL: redis://127.0.0.1:6379
+        run: |
+          uv run pytest -q -o addopts='' -k valkey \
+            tests/vectordb/valkey_backend \
+            tests/misc/test_config_validation.py
 
   langchain-tests:
     needs: check-deps
