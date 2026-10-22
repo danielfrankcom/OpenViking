@@ -18,7 +18,8 @@ How each field type is stored (see ``index_values``):
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping
+import re
+from typing import Any, Dict, List, Mapping
 
 TAG_SEPARATOR = "\x1f"
 # Valkey Search strips whitespace around TAG values and treats a trailing "*" as a
@@ -36,6 +37,13 @@ MATCH_NONE = f"-{MATCH_ALL}"
 NUMERIC_TYPES = {"int64", "float32", "date_time", "bool"}
 TAG_TYPES = {"string", "text", "list<string>", "list<int64>"}
 PATH_TYPE = "path"
+
+# Valkey Search has no substring or regex match on TAG/NUMERIC fields, so these
+# clauses are evaluated by the collection itself (see ValkeyCollection._resolve_filter).
+CLIENT_SIDE_OPS = ("contains", "regex")
+# Filter nodes that compile to "every record" and "no record".
+TRUE_NODE: Dict[str, Any] = {"op": "and", "conds": []}
+FALSE_NODE: Dict[str, Any] = {"op": "or", "conds": []}
 
 
 def ancestors_field(field: str) -> str:
@@ -125,10 +133,88 @@ def compile_filter(node: Mapping[str, Any] | None, field_types: Mapping[str, str
         return "-" + _range(field, node)
     if op == "prefix":
         return f"@{field}:{{{_escape(TAG_MARK + str(node['prefix']))}*}}"
-    # Open decision (unsupported filter ops): contains/regex need substring matching,
-    # which Valkey Search TAG and NUMERIC fields do not offer; geo_range has no Valkey
-    # Search field type. They are rejected rather than emulated until maintainers decide.
+    if op in CLIENT_SIDE_OPS:
+        raise ValueError(f"{op!r} clauses must be replaced before compiling the filter")
+    # geo_range is rejected: Valkey Search has no geo field type here, no OpenViking
+    # schema has a geo_point field, and the local backend rejects geo_range on any
+    # other field type ("geo_range field must be geo_point").
     raise NotImplementedError(f"Valkey vector backend does not support filter op {op!r}")
+
+
+def client_side_clauses(node: Mapping[str, Any] | None) -> List[Mapping[str, Any]]:
+    """Return the contains/regex clauses of ``node`` in tree order."""
+    if not node:
+        return []
+    if node.get("op") in ("and", "or"):
+        return [clause for child in node.get("conds", []) for clause in client_side_clauses(child)]
+    return [node] if node.get("op") in CLIENT_SIDE_OPS else []
+
+
+def replace_client_side_clauses(node: Mapping[str, Any], results: List[bool]) -> Dict[str, Any]:
+    """Copy ``node`` with its contains/regex clauses, in tree order, fixed to ``results``."""
+    remaining = iter(results)
+
+    def replace(current: Mapping[str, Any]) -> Dict[str, Any]:
+        if current.get("op") in ("and", "or"):
+            return {**current, "conds": [replace(child) for child in current.get("conds", [])]}
+        if current.get("op") in CLIENT_SIDE_OPS:
+            return TRUE_NODE if next(remaining) else FALSE_NODE
+        return dict(current)
+
+    return replace(node)
+
+
+def clause_matches(
+    clause: Mapping[str, Any], record: Mapping[str, Any], field_type: str | None
+) -> bool:
+    """Evaluate one contains/regex clause on one record exactly like the local engine.
+
+    ``record`` must already have date_time values converted to epoch milliseconds, and
+    ``field_type`` is None when the field is not a scalar index field.
+
+    The local engine (bitmap_field_group.cpp) matches the clause against the keys of
+    the field's bitmap index and returns the records under every matching key:
+
+    * only scalar index fields have keys, and float32 fields have none;
+    * a key is the value as text, with integers, date_time and bool as decimal
+      digits (bool is 1/0), one key per list element, every key split again at ";",
+      and path keys given a leading "/";
+    * contains is a byte substring test, regex is std::regex_search (ECMAScript) on
+      the UTF-8 bytes;
+    * an empty substring or pattern, and an invalid pattern, match nothing.
+    """
+    if field_type is None or field_type == "float32":
+        return False
+    if clause["op"] == "contains":
+        substring = clause.get("substring")
+        if not substring:
+            return False
+        return any(
+            substring in key for key in _local_index_keys(record.get(clause["field"]), field_type)
+        )
+    pattern = clause.get("pattern")
+    if not pattern:
+        return False
+    try:
+        # Byte patterns make "." one byte and \w, \d, \s ASCII-only, as in std::regex.
+        compiled = re.compile(pattern.encode())
+    except re.error:
+        return False
+    keys = _local_index_keys(record.get(clause["field"]), field_type)
+    return any(compiled.search(key.encode()) for key in keys)
+
+
+def _local_index_keys(value: Any, field_type: str) -> List[str]:
+    if value is None:
+        return []
+    keys = []
+    for item in value if isinstance(value, list) else [value]:
+        text = str(int(item)) if isinstance(item, (bool, int)) else str(item)
+        for key in text.split(";"):
+            if field_type == PATH_TYPE and key and not key.startswith("/"):
+                key = "/" + key
+            keys.append(key)
+    return keys
 
 
 def _match_any(field: str, field_type: str | None, conds: list[Any], para: Any) -> str:

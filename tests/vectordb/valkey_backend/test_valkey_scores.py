@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from openviking.storage.collection_schemas import CollectionSchemas
+from openviking.storage.expr import Contains
 
 pytestmark = pytest.mark.integration
 
@@ -79,10 +80,19 @@ def test_event_time_decay_matches_local(make_valkey_adapter, make_local_adapter)
     }
     query = [1.0, 0.3, 0.1, 0.2]
 
-    local_hits = local.query(query_vector=query, limit=8, offset=2, advance=advance)
-    valkey_hits = valkey.query(query_vector=query, limit=8, offset=2, advance=advance)
+    # The contains cases are evaluated by the backend itself; the last one recalls fewer
+    # records (3 * (2 + 1) = 9) than the 11 that match, so recall must keep the closest.
+    contains = Contains("uri", "/events/e1")
+    for expr, limit, offset in ((None, 8, 2), (contains, 8, 2), (contains, 2, 1)):
+        local_hits = local.query(
+            query_vector=query, limit=limit, offset=offset, advance=advance, filter=expr
+        )
+        valkey_hits = valkey.query(
+            query_vector=query, limit=limit, offset=offset, advance=advance, filter=expr
+        )
 
-    assert [hit["id"] for hit in valkey_hits] == [hit["id"] for hit in local_hits]
-    for local_hit, valkey_hit in zip(local_hits, valkey_hits, strict=True):
-        for key in ("_score", "_origin_score", "_time_score"):
-            assert valkey_hit[key] == pytest.approx(local_hit[key], rel=0.02, abs=1e-6), key
+        assert len(local_hits) == limit
+        assert [hit["id"] for hit in valkey_hits] == [hit["id"] for hit in local_hits]
+        for local_hit, valkey_hit in zip(local_hits, valkey_hits, strict=True):
+            for key in ("_score", "_origin_score", "_time_score"):
+                assert valkey_hit[key] == pytest.approx(local_hit[key], rel=0.02, abs=1e-6), key

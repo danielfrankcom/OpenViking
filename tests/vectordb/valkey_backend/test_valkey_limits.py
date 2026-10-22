@@ -8,7 +8,7 @@ import os
 import pytest
 
 from openviking.storage.collection_schemas import CollectionSchemas
-from openviking.storage.expr import Eq, Range
+from openviking.storage.expr import And, Contains, Eq, Range
 from openviking.storage.vectordb_adapters.factory import create_collection_adapter
 from openviking.storage.vectordb_adapters.valkey.collection import (
     DEFAULT_NONVECTOR_CAP,
@@ -93,11 +93,15 @@ def test_nonvector_cap_raises_instead_of_partial_results(make_valkey_adapter, se
     # Delete-by-filter enumerates with scroll pages first, so it deletes nothing.
     with pytest.raises(RuntimeError, match=cap_error):
         adapter.delete(filter=Eq("account_id", "acct"))
+    # contains/regex read their whole superset with non-vector queries.
+    with pytest.raises(RuntimeError, match=cap_error):
+        adapter.query(filter=Contains("uri", "/d1/"), limit=10, query_vector=[1, 0, 0, 0])
 
     # Below the cap every path is exact, and the failed delete removed nothing.
     small = Range("active_count", lt=300)
     assert adapter.count(small) == 300
     assert sorted(_scroll_ids(adapter, small)) == [f"r{i:05d}" for i in range(300)]
+    assert adapter.count(And([small, Contains("uri", "/d1/")])) == 30
     # KNN queries are not subject to this cap (the KNN cap bounds them).
     assert len(adapter.query(limit=2000)) == 2000
 
@@ -112,6 +116,7 @@ def test_cluster_total_above_cap_is_exact_when_no_shard_reaches_it(
     adapter = _filled(make_valkey_adapter(), 2000)
     assert adapter.count() == 2000
     assert len(set(_scroll_ids(adapter, Eq("account_id", "acct"), page_size=500))) == 2000
+    assert adapter.count(Contains("uri", "/d1/")) == 200
 
 
 def test_knn_cap_error_names_the_setting_and_the_k_needed(make_valkey_adapter, server_settings):
@@ -122,6 +127,9 @@ def test_knn_cap_error_names_the_setting_and_the_k_needed(make_valkey_adapter, s
     with pytest.raises(RuntimeError, match=rf"K=1000: {knn_error} must be at least 1000"):
         adapter.query(limit=1000)
     assert len(adapter.query(limit=100)) == 100
+    # A contains filter ranks its whole superset (here all 200 records).
+    with pytest.raises(RuntimeError, match=rf"{knn_error} must be at least 200"):
+        adapter.query(filter=Contains("uri", "/d1/"), limit=10)
     with pytest.raises(RuntimeError, match="above its maximum of 100000"):
         adapter.query(limit=100001)
 
@@ -147,6 +155,7 @@ def test_non_admin_user_assumes_the_default_cap(make_valkey_adapter, valkey_conf
         )
         assert adapter._nonvector_cap == DEFAULT_NONVECTOR_CAP
         assert adapter.count() == 3
+        assert adapter.count(Contains("uri", "/d1/")) == 1
         adapter.close()
     finally:
         admin._client.execute_command("ACL", "DELUSER", "ovapp")

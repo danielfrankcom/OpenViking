@@ -14,24 +14,59 @@ from openviking.storage.vectordb_adapters.valkey.filter import (
     MATCH_NONE,
     TAG_MARK,
     TAG_SEPARATOR,
+    clause_matches,
+    client_side_clauses,
     compile_filter,
     index_values,
+    replace_client_side_clauses,
 )
 
 FIELD_TYPES = {"uri": "path", "level": "int64", "name": "string", "search_tags": "list<string>"}
 
 
+def test_geo_range_is_rejected():
+    node = {"op": "geo_range", "field": "location", "center": [0, 0], "radius": 1}
+    with pytest.raises(NotImplementedError, match="geo_range"):
+        compile_filter({"op": "and", "conds": [node]}, FIELD_TYPES)
+
+
+def test_contains_and_regex_compile_only_after_replacement():
+    contains = {"op": "contains", "field": "uri", "substring": "b.md#"}
+    regex = {"op": "regex", "field": "name", "pattern": "a.*"}
+    node = {"op": "or", "conds": [{"op": "must", "field": "level", "conds": [1]}, contains, regex]}
+    assert client_side_clauses(node) == [contains, regex]
+    with pytest.raises(ValueError, match="must be replaced"):
+        compile_filter(node, FIELD_TYPES)
+    assert compile_filter(replace_client_side_clauses(node, [True, False]), FIELD_TYPES) == (
+        f"(@level:[1 1] | {MATCH_ALL} | {MATCH_NONE})"
+    )
+
+
 @pytest.mark.parametrize(
-    "node",
+    ("clause", "record", "field_type", "expected"),
     [
-        {"op": "contains", "field": "uri", "substring": "b.md#"},
-        {"op": "regex", "field": "name", "pattern": "a.*"},
-        {"op": "geo_range", "field": "location", "center": [0, 0], "radius": 1},
+        ({"op": "contains", "substring": "b.md#"}, {"f": "/a/b.md#c"}, "path", True),
+        # Stored URIs are encoded; an unencoded substring matches only a literal one.
+        ({"op": "contains", "substring": "viking://a"}, {"f": "/a"}, "path", False),
+        ({"op": "contains", "substring": "/a"}, {"f": "a"}, "path", True),
+        ({"op": "contains", "substring": "x;y"}, {"f": "x;y"}, "string", False),
+        ({"op": "contains", "substring": "y"}, {"f": ["k", "x;y"]}, "list<string>", True),
+        ({"op": "contains", "substring": "17"}, {"f": 1767225600000}, "date_time", True),
+        ({"op": "contains", "substring": "1"}, {"f": True}, "bool", True),
+        ({"op": "contains", "substring": "1"}, {"f": 1.5}, "float32", False),
+        ({"op": "contains", "substring": "a"}, {"f": "a"}, None, False),
+        ({"op": "contains", "substring": ""}, {"f": "a"}, "string", False),
+        ({"op": "regex", "pattern": "^$"}, {"f": ""}, "string", True),
+        ({"op": "regex", "pattern": "^$"}, {}, "string", False),
+        ({"op": "regex", "pattern": "^.$"}, {"f": "é"}, "string", False),
+        ({"op": "regex", "pattern": "^..$"}, {"f": "é"}, "string", True),
+        ({"op": "regex", "pattern": "^\\w$"}, {"f": "é"}, "string", False),
+        ({"op": "regex", "pattern": "("}, {"f": "("}, "string", False),
+        ({"op": "regex", "pattern": ""}, {"f": "a"}, "string", False),
     ],
 )
-def test_unsupported_filter_ops_are_rejected(node):
-    with pytest.raises(NotImplementedError, match=node["op"]):
-        compile_filter({"op": "and", "conds": [node]}, FIELD_TYPES)
+def test_clauses_match_like_the_local_engine_index_keys(clause, record, field_type, expected):
+    assert clause_matches({**clause, "field": "f"}, record, field_type) is expected
 
 
 def test_empty_logic_nodes_are_evaluated():

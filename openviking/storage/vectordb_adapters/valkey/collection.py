@@ -33,7 +33,7 @@ import math
 import random
 import struct
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from openviking.storage.vectordb.collection.collection import ICollection
 from openviking.storage.vectordb.collection.result import (
@@ -56,10 +56,13 @@ from .filter import (
     TAG_SEPARATOR,
     TAG_TYPES,
     ancestors_field,
+    clause_matches,
+    client_side_clauses,
     compile_filter,
     depth_field,
     index_values,
     indexed_hash_fields,
+    replace_client_side_clauses,
 )
 
 KNN_CAP_SETTING = "search.max-vector-knn"
@@ -433,9 +436,59 @@ class ValkeyCollection(ICollection):
     # Search
     # ------------------------------------------------------------------
 
-    def _query(self, index_name: str, filters: Optional[Dict[str, Any]]) -> str:
+    def _resolve_filter(
+        self, index_name: str, filters: Optional[Dict[str, Any]]
+    ) -> Tuple[str, Optional[Set[str]], int]:
+        """Compile ``filters`` into a query; evaluate contains/regex clauses here.
+
+        Returns ``(query, exact_ids, candidates)``. For a filter without contains or
+        regex clauses the query is exact, ``exact_ids`` is None and ``candidates`` 0.
+
+        Valkey Search cannot match substrings or regexes, so otherwise the query is a
+        superset that takes every such clause as true (a superset because the DSL
+        negates only single clauses, never subtrees). ``exact_ids`` are the ids that
+        match the whole filter and ``candidates`` is the number of records the
+        superset matches; callers rank the superset and keep only ``exact_ids``.
+
+        Each candidate's clauses are evaluated on its stored record, as the local
+        engine evaluates them on its index keys (``filter.clause_matches``). The rest
+        of the filter stays with Valkey Search: a candidate matches iff the filter, with
+        the clauses fixed to that candidate's results, matches it. One query per
+        distinct combination of results decides every candidate with that
+        combination, so a single clause needs at most one extra query.
+
+        Cost: every candidate's document is read, and every query here is non-vector,
+        so the superset must stay under the non-vector cap (``_count`` checks it).
+        """
         converted = self._data_processor.convert_filter_for_index(copy.deepcopy(filters or {}))
-        return compile_filter(converted, self._indexed_types(index_name))
+        field_types = self._indexed_types(index_name)
+        clauses = client_side_clauses(converted)
+        if not clauses:
+            return compile_filter(converted, field_types), None, 0
+
+        def query_with(results: List[bool]) -> str:
+            return compile_filter(replace_client_side_clauses(converted, results), field_types)
+
+        superset = query_with([True] * len(clauses))
+        docs = self._matching_docs(index_name, superset)
+        ids_by_results: Dict[Tuple[bool, ...], List[str]] = {}
+        for record_id, doc in docs.items():
+            record = self._data_processor.convert_fields_dict_for_index(json.loads(doc))
+            results = tuple(
+                clause_matches(clause, record, field_types.get(clause.get("field", "")))
+                for clause in clauses
+            )
+            ids_by_results.setdefault(results, []).append(record_id)
+        exact_ids: Set[str] = set()
+        for results, ids in ids_by_results.items():
+            if all(results):
+                # With every clause true the filter is the superset query itself.
+                exact_ids.update(ids)
+            else:
+                exact_ids.update(
+                    self._matching_ids(index_name, query_with(list(results))) & set(ids)
+                )
+        return superset, exact_ids, len(docs)
 
     def _count(self, index_name: str, query: str) -> int:
         """Count the records a query matches; raise if the non-vector cap may have cut it."""
@@ -464,6 +517,35 @@ class ValkeyCollection(ICollection):
         if not isinstance(replies, dict):
             replies = {"only primary": replies}
         return max(int(_text(_as_dict(reply)["num_docs"])) for reply in replies.values())
+
+    def _matching_docs(self, index_name: str, query: str) -> Dict[str, Any]:
+        """Return ``{id: stored __doc}`` for every record a non-vector query matches."""
+        total = self._count(index_name, query)
+        if total == 0:
+            return {}
+        reply = self._client.execute_command(
+            "FT.SEARCH",
+            self._ft_name(index_name),
+            query,
+            "RETURN",
+            "1",
+            DOC_FIELD,
+            "LIMIT",
+            "0",
+            str(total),
+        )
+        return {record_id: values[DOC_FIELD] for record_id, values in self._rows(reply)}
+
+    def _matching_ids(self, index_name: str, query: str) -> Set[str]:
+        """Return the id of every record a non-vector query matches."""
+        total = self._count(index_name, query)
+        if total == 0:
+            return set()
+        reply = self._client.execute_command(
+            "FT.SEARCH", self._ft_name(index_name), query, "NOCONTENT", "LIMIT", "0", str(total)
+        )
+        prefix_length = len(self._key(""))
+        return {_text(key)[prefix_length:] for key in reply[1:]}
 
     def _return_fields(self, output_fields: Optional[List[str]], *extra: str) -> List[str]:
         fields = [DOC_FIELD, *extra]
@@ -496,8 +578,14 @@ class ValkeyCollection(ICollection):
         window = limit + offset
         if time_decay is not None:
             window = min(window * TIME_DECAY_RECALL_FACTOR, TIME_DECAY_MAX_RECALL)
+        query_filter, exact_ids, candidates = self._resolve_filter(index_name, filters)
         k, first = window, (0 if time_decay is not None else offset)
-        prefilter = f"({self._query(index_name, filters)})" if filters else "*"
+        if exact_ids is not None:
+            # The filter query is a superset: rank all of it, keep exact matches below.
+            if candidates == 0:
+                return SearchResult()
+            k, first = candidates, 0
+        prefilter = f"({query_filter})" if filters else "*"
         query = f"{prefilter}=>[KNN {k} @{self._vector_field} $vector AS {DISTANCE_FIELD}]"
         try:
             reply = self._client.execute_command(
@@ -529,6 +617,10 @@ class ValkeyCollection(ICollection):
             record = self._decode(values[DOC_FIELD], values.get(self._vector_field))
             score = _score_from_distance(metric.lower(), float(values[DISTANCE_FIELD]))
             hits.append((primary_key, record, score))
+        if exact_ids is not None:
+            hits = [hit for hit in hits if hit[0] in exact_ids][:window]
+            if time_decay is None:
+                hits = hits[offset:]
         if time_decay is not None:
             items = self._apply_time_decay(hits, time_decay, output_fields)
             return SearchResult(data=items[offset : offset + limit])
@@ -600,9 +692,17 @@ class ValkeyCollection(ICollection):
         # Open decision (missing sort field): records without the field are kept and
         # sorted last; the local sorter drops them without a filter and places them
         # arbitrarily with one.
-        query = self._query(index_name, filters)
-        # FT.AGGREGATE returns no total, so count separately to detect the cap.
-        self._count(index_name, query)
+        query, exact_ids, candidates = self._resolve_filter(index_name, filters)
+        first, count = offset, limit
+        if exact_ids is None:
+            # FT.AGGREGATE returns no total, so count separately to detect the cap.
+            self._count(index_name, query)
+        else:
+            # The query is a superset whose size _resolve_filter has counted (and
+            # checked against the cap): sort all of it, keep exact matches below.
+            if candidates == 0:
+                return SearchResult()
+            first, count = 0, candidates
         reply = self._client.execute_command(
             "FT.AGGREGATE",
             self._ft_name(index_name),
@@ -624,16 +724,20 @@ class ValkeyCollection(ICollection):
             "@__key",
             direction,
             "MAX",
-            str(offset + limit),
+            str(first + count),
             "LIMIT",
-            str(offset),
-            str(limit),
+            str(first),
+            str(count),
         )
         # FT.AGGREGATE before 1.3 can LOAD only indexed attributes, so read the
         # documents by key afterwards.
         # The reply is [total, [name, value, ...], ...], one list per row.
         prefix_length = len(self._key(""))
         ids = [_text(_as_dict(row)["__key"])[prefix_length:] for row in reply[1:]]
+        if exact_ids is not None:
+            ids = [record_id for record_id in ids if record_id in exact_ids][
+                offset : offset + limit
+            ]
         found = self._read_records(ids)
         # Like the local collection, the sort value is reported as the score.
         return SearchResult(
@@ -697,9 +801,16 @@ class ValkeyCollection(ICollection):
     ) -> AggregateResult:
         if op != "count":
             raise NotImplementedError(f"Valkey vector backend does not support aggregate op {op!r}")
-        query = self._query(index_name, filters)
+        query, exact_ids, _ = self._resolve_filter(index_name, filters)
         if field is None:
-            return AggregateResult(agg={"_total": self._count(index_name, query)}, op=op)
+            total = len(exact_ids) if exact_ids is not None else self._count(index_name, query)
+            return AggregateResult(agg={"_total": total}, op=op)
+        if exact_ids is not None:
+            # No OpenViking caller groups counts (adapters call aggregate_data without
+            # a field), so contains/regex are not combined with GROUPBY.
+            raise NotImplementedError(
+                "Valkey vector backend does not support contains/regex in a grouped count"
+            )
         field_type = self._indexed_types(index_name).get(field)
         if field_type not in NUMERIC_TYPES and field_type not in {"string", "text"}:
             raise NotImplementedError(f"Valkey vector backend cannot group by {field_type} field")
