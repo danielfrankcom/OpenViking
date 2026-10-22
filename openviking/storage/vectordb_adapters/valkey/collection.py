@@ -14,6 +14,15 @@ Storage layout for a collection named ``C``:
 Writes use plain commands, never MULTI or Lua: Valkey Search blocks the writing
 client until the mutation is indexed, so a record is searchable as soon as the
 write returns (read-after-write).
+
+Two server limits shape the search code:
+
+* ``search.max-vector-knn`` bounds K. A larger K is rejected by the server; the
+  error is re-raised naming the setting and the K that was needed.
+* ``search.max-nonvector-search-results-fetched`` ("the cap") bounds how many
+  records every non-KNN query considers, per shard. The server truncates silently,
+  so every non-KNN query is preceded or followed by a count, and a count that may
+  have hit the cap raises instead of returning partial results.
 """
 
 from __future__ import annotations
@@ -53,6 +62,13 @@ from .filter import (
     indexed_hash_fields,
 )
 
+KNN_CAP_SETTING = "search.max-vector-knn"
+NONVECTOR_CAP_SETTING = "search.max-nonvector-search-results-fetched"
+# Valkey Search's default for NONVECTOR_CAP_SETTING.
+DEFAULT_NONVECTOR_CAP = 100_000
+# Valkey Search rejects a larger K whatever KNN_CAP_SETTING says.
+MAX_KNN = 100_000
+
 DOC_FIELD = "__doc"
 DISTANCE_FIELD = "__distance"
 BACKFILL_TIMEOUT_SECONDS = 300
@@ -80,12 +96,20 @@ def _as_dict(flat_reply: List[Any]) -> Dict[str, Any]:
 
 
 class ValkeyCollection(ICollection):
-    def __init__(self, client: Any, cluster_mode: bool, name: str, meta: Dict[str, Any]):
+    def __init__(
+        self,
+        client: Any,
+        cluster_mode: bool,
+        name: str,
+        meta: Dict[str, Any],
+        nonvector_cap: int = DEFAULT_NONVECTOR_CAP,
+    ):
         super().__init__()
         self._client = client
         self._cluster_mode = cluster_mode
         self._name = name
         self._meta = meta
+        self._nonvector_cap = nonvector_cap
         self._load_schema()
 
     # ------------------------------------------------------------------
@@ -93,21 +117,34 @@ class ValkeyCollection(ICollection):
     # ------------------------------------------------------------------
 
     @classmethod
-    def create(cls, client: Any, cluster_mode: bool, name: str, collection_meta: Dict[str, Any]):
+    def create(
+        cls,
+        client: Any,
+        cluster_mode: bool,
+        name: str,
+        collection_meta: Dict[str, Any],
+        nonvector_cap: int = DEFAULT_NONVECTOR_CAP,
+    ):
         validation.validate_collection_meta_data(collection_meta)
         meta = {"collection": copy.deepcopy(collection_meta), "indexes": {}}
-        collection = cls(client, cluster_mode, name, meta)
+        collection = cls(client, cluster_mode, name, meta, nonvector_cap)
         if not collection._primary_key:
             raise ValueError("Valkey vector backend requires a primary key field")
         collection._save_meta()
         return collection
 
     @classmethod
-    def open(cls, client: Any, cluster_mode: bool, name: str) -> Optional["ValkeyCollection"]:
+    def open(
+        cls,
+        client: Any,
+        cluster_mode: bool,
+        name: str,
+        nonvector_cap: int = DEFAULT_NONVECTOR_CAP,
+    ) -> Optional["ValkeyCollection"]:
         raw = client.get(f"ovvec-meta:{name}")
         if raw is None:
             return None
-        return cls(client, cluster_mode, name, json.loads(raw))
+        return cls(client, cluster_mode, name, json.loads(raw), nonvector_cap)
 
     def _load_schema(self) -> None:
         fields = self._meta["collection"].get("Fields", [])
@@ -400,6 +437,34 @@ class ValkeyCollection(ICollection):
         converted = self._data_processor.convert_filter_for_index(copy.deepcopy(filters or {}))
         return compile_filter(converted, self._indexed_types(index_name))
 
+    def _count(self, index_name: str, query: str) -> int:
+        """Count the records a query matches; raise if the non-vector cap may have cut it."""
+        reply = self._client.execute_command(
+            "FT.SEARCH", self._ft_name(index_name), query, "LIMIT", "0", "0"
+        )
+        total = int(reply[0])
+        if total < self._nonvector_cap:
+            return total
+        # The cap applies per shard: in cluster mode a larger total is complete when
+        # no shard holds that many records.
+        if self._cluster_mode and self._largest_shard_size(index_name) < self._nonvector_cap:
+            return total
+        raise RuntimeError(
+            f"Valkey Search may have returned partial results: the query matches at least "
+            f"{self._nonvector_cap} records on one shard, the most a non-vector query "
+            f"considers ({NONVECTOR_CAP_SETTING}). Raise {NONVECTOR_CAP_SETTING} above the "
+            f"number of records per shard (4294967295 removes the cap)."
+        )
+
+    def _largest_shard_size(self, index_name: str) -> int:
+        # Without the CLUSTER scope, FT.INFO reports the node's own records.
+        replies = self._client.execute_command(
+            "FT.INFO", self._ft_name(index_name), target_nodes=self._client.PRIMARIES
+        )
+        if not isinstance(replies, dict):
+            replies = {"only primary": replies}
+        return max(int(_text(_as_dict(reply)["num_docs"])) for reply in replies.values())
+
     def _return_fields(self, output_fields: Optional[List[str]], *extra: str) -> List[str]:
         fields = [DOC_FIELD, *extra]
         if output_fields is None or self._vector_field in output_fields:
@@ -431,25 +496,33 @@ class ValkeyCollection(ICollection):
         window = limit + offset
         if time_decay is not None:
             window = min(window * TIME_DECAY_RECALL_FACTOR, TIME_DECAY_MAX_RECALL)
+        k, first = window, (0 if time_decay is not None else offset)
         prefilter = f"({self._query(index_name, filters)})" if filters else "*"
-        # Open decision (server limits): OpenViking fetches all records with K = 100000
-        # (filter(limit=100000)); the server rejects K above search.max-vector-knn
-        # (default 10000), and the backend does not check the setting.
-        query = f"{prefilter}=>[KNN {window} @{self._vector_field} $vector AS {DISTANCE_FIELD}]"
-        first = 0 if time_decay is not None else offset
-        reply = self._client.execute_command(
-            "FT.SEARCH",
-            self._ft_name(index_name),
-            query,
-            "PARAMS",
-            "2",
-            "vector",
-            struct.pack(f"<{len(dense_vector)}f", *dense_vector),
-            *self._return_fields(output_fields, DISTANCE_FIELD),
-            "LIMIT",
-            str(first),
-            str(window - first),
-        )
+        query = f"{prefilter}=>[KNN {k} @{self._vector_field} $vector AS {DISTANCE_FIELD}]"
+        try:
+            reply = self._client.execute_command(
+                "FT.SEARCH",
+                self._ft_name(index_name),
+                query,
+                "PARAMS",
+                "2",
+                "vector",
+                struct.pack(f"<{len(dense_vector)}f", *dense_vector),
+                *self._return_fields(output_fields, DISTANCE_FIELD),
+                "LIMIT",
+                str(first),
+                str(k - first),
+            )
+        except Exception as error:
+            # OpenViking's fetch-all callers ask for K = 100000 (filter(limit=100000)),
+            # and Valkey Search rejects K above the setting (default 10000).
+            if "KNN parameter" not in str(error) or k < 1:
+                raise
+            needed = f"at least {k}" if k <= MAX_KNN else f"{k}, above its maximum of {MAX_KNN}"
+            raise RuntimeError(
+                f"Valkey Search rejected a vector query with K={k}: {KNN_CAP_SETTING} "
+                f"must be {needed}. Server error: {error}"
+            ) from error
         metric = str(self._meta["indexes"][index_name]["VectorIndex"].get("Distance", "cosine"))
         hits = []
         for primary_key, values in self._rows(reply):
@@ -527,13 +600,13 @@ class ValkeyCollection(ICollection):
         # Open decision (missing sort field): records without the field are kept and
         # sorted last; the local sorter drops them without a filter and places them
         # arbitrarily with one.
-        # Open decision (server limits): FT.AGGREGATE considers at most
-        # search.max-nonvector-search-results-fetched matches and truncates silently;
-        # the backend does not check the setting.
+        query = self._query(index_name, filters)
+        # FT.AGGREGATE returns no total, so count separately to detect the cap.
+        self._count(index_name, query)
         reply = self._client.execute_command(
             "FT.AGGREGATE",
             self._ft_name(index_name),
-            self._query(index_name, filters),
+            query,
             "LOAD",
             "2",
             "@__key",
@@ -626,15 +699,12 @@ class ValkeyCollection(ICollection):
             raise NotImplementedError(f"Valkey vector backend does not support aggregate op {op!r}")
         query = self._query(index_name, filters)
         if field is None:
-            # Open decision (server limits): the total is capped at
-            # search.max-nonvector-search-results-fetched without any error.
-            reply = self._client.execute_command(
-                "FT.SEARCH", self._ft_name(index_name), query, "LIMIT", "0", "0"
-            )
-            return AggregateResult(agg={"_total": int(reply[0])}, op=op)
+            return AggregateResult(agg={"_total": self._count(index_name, query)}, op=op)
         field_type = self._indexed_types(index_name).get(field)
         if field_type not in NUMERIC_TYPES and field_type not in {"string", "text"}:
             raise NotImplementedError(f"Valkey vector backend cannot group by {field_type} field")
+        # FT.AGGREGATE returns no total, so count separately to detect the cap.
+        self._count(index_name, query)
         reply = self._client.execute_command(
             "FT.AGGREGATE",
             self._ft_name(index_name),

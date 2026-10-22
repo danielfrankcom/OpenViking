@@ -18,13 +18,22 @@ from urllib.parse import urlparse
 
 from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb_adapters.base import CollectionAdapter
+from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.vectordb_config import (
     DEFAULT_INDEX_NAME,
     ValkeyConfig,
     VectorDBBackendConfig,
 )
 
-from .valkey.collection import ValkeyCollection
+from .valkey.collection import (
+    DEFAULT_NONVECTOR_CAP,
+    KNN_CAP_SETTING,
+    MAX_KNN,
+    NONVECTOR_CAP_SETTING,
+    ValkeyCollection,
+)
+
+logger = get_logger(__name__)
 
 # Open decision (minimum version): the backend needs Valkey Search 1.2.1 (Valkey
 # 9.0.1 or later). 1.2.0 can drop replies to pipelined HSETs and older versions cannot
@@ -102,6 +111,42 @@ def _connect(config: ValkeyConfig) -> tuple[Any, list[Any]]:
     return Redis(host=host, port=port, db=config.db, **options), []
 
 
+def _read_nonvector_cap(client: Any) -> int:
+    """Return the server's non-vector result cap and warn about a low KNN cap.
+
+    CONFIG GET needs @admin, which an application ACL user usually lacks; the
+    server's default cap is assumed then. A cap lowered below the default on such a
+    deployment is not detected.
+    """
+    from redis.exceptions import ResponseError
+
+    try:
+        reply = client.execute_command("CONFIG", "GET", KNN_CAP_SETTING, NONVECTOR_CAP_SETTING)
+    except ResponseError as error:
+        logger.info(
+            "Cannot read Valkey Search limits (%s); assuming %s=%d",
+            error,
+            NONVECTOR_CAP_SETTING,
+            DEFAULT_NONVECTOR_CAP,
+        )
+        return DEFAULT_NONVECTOR_CAP
+    settings = {
+        name.decode() if isinstance(name, bytes) else name: int(value)
+        for name, value in zip(reply[::2], reply[1::2], strict=True)
+    }
+    knn_cap = settings.get(KNN_CAP_SETTING, MAX_KNN)
+    if knn_cap < MAX_KNN:
+        logger.warning(
+            "%s is %d; OpenViking's fetch-all queries ask for K=%d and will fail",
+            KNN_CAP_SETTING,
+            knn_cap,
+            MAX_KNN,
+        )
+    cap = settings.get(NONVECTOR_CAP_SETTING, DEFAULT_NONVECTOR_CAP)
+    # Valkey Search 1.2.1 reports values of 2^31 and above as negative numbers.
+    return cap + 2**32 if cap < 0 else cap
+
+
 class ValkeyCollectionAdapter(CollectionAdapter):
     """Adapter for one OpenViking collection stored in Valkey Search."""
 
@@ -114,6 +159,7 @@ class ValkeyCollectionAdapter(CollectionAdapter):
         # redis-py connects lazily; fail here on a wrong address, credential or
         # certificate instead of on the first vector operation.
         self._client.ping()
+        self._nonvector_cap = _read_nonvector_cap(self._client)
 
     @classmethod
     def from_config(cls, config: VectorDBBackendConfig) -> "ValkeyCollectionAdapter":
@@ -132,13 +178,17 @@ class ValkeyCollectionAdapter(CollectionAdapter):
     def _load_existing_collection_if_needed(self) -> None:
         if self._collection is not None:
             return
-        collection = ValkeyCollection.open(self._client, self._is_cluster, self._collection_name)
+        collection = ValkeyCollection.open(
+            self._client, self._is_cluster, self._collection_name, self._nonvector_cap
+        )
         if collection is not None:
             self._collection = Collection(collection)
 
     def _create_backend_collection(self, meta: Dict[str, Any]) -> Collection:
         return Collection(
-            ValkeyCollection.create(self._client, self._is_cluster, self._collection_name, meta)
+            ValkeyCollection.create(
+                self._client, self._is_cluster, self._collection_name, meta, self._nonvector_cap
+            )
         )
 
     def _build_default_index_meta(
