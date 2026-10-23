@@ -181,7 +181,12 @@ class ValkeyCollectionAdapter(CollectionAdapter):
         collection = ValkeyCollection.open(
             self._client, self._is_cluster, self._collection_name, self._nonvector_cap
         )
-        if collection is not None:
+        # The meta is written before the FT index is created, so a meta without any
+        # index is a collection whose creation has not finished: it is still being
+        # created by another process, or its FT.CREATE failed. Report it as missing so
+        # that create_collection runs (FT.CREATE accepts an existing matching index)
+        # instead of caching a collection that has no index to write to.
+        if collection is not None and collection.list_indexes():
             self._collection = Collection(collection)
 
     def _create_backend_collection(self, meta: Dict[str, Any]) -> Collection:
@@ -211,6 +216,15 @@ class ValkeyCollectionAdapter(CollectionAdapter):
             },
             "ScalarIndex": scalar_index_fields,
         }
+
+    def create_collection(self, name: str, schema: Dict[str, Any], **kwargs: Any) -> bool:
+        try:
+            return super().create_collection(name, schema, **kwargs)
+        except Exception:
+            # The base class caches the handle before it creates the FT index. Drop it
+            # so that collection_exists() does not report a collection without an index.
+            self._collection = None
+            raise
 
     def update_data(self, data_list: List[Dict[str, Any]]) -> List[str]:
         records = [self._normalize_record_for_write(record) for record in data_list]

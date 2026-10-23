@@ -191,3 +191,46 @@ def test_non_default_database_is_isolated(make_valkey_adapter, valkey_params):
     assert in_db3.count() == 1
     assert in_db0.collection_exists() is False
     assert in_db3._client.dbsize() == 2  # record + collection meta
+
+
+def test_create_accepts_existing_matching_ft_index(make_valkey_adapter):
+    # Another process is creating the same collection: its meta is written and its FT
+    # index exists, but the meta does not list the index yet. (redis-py resending
+    # FT.CREATE after a client-side timeout reaches the same FT.CREATE error.)
+    first = make_valkey_adapter()
+    assert _create(first)
+    collection = first.get_collection()._Collection__collection
+    collection._meta["indexes"] = {}
+    collection._save_meta()
+
+    second = make_valkey_adapter(name=first.collection_name)
+    assert _create(second) is True
+    assert second.get_collection().list_indexes() == ["default"]
+    second.upsert({"id": "r1", "uri": "viking://resources/a.md", "vector": [1, 0, 0, 0]})
+    assert [r["id"] for r in second.query(filter=Eq("uri", "viking://resources/a.md"))] == ["r1"]
+    first._collection = None  # let the fixture's drop reload the completed meta
+
+
+def test_create_rejects_existing_ft_index_with_other_schema(make_valkey_adapter):
+    adapter = make_valkey_adapter()
+    ft_name = f"ovvec:{adapter.collection_name}:default"
+    adapter._client.execute_command(
+        "FT.CREATE",
+        ft_name,
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        f"ovvec:{adapter.collection_name}:",
+        "SCHEMA",
+        "other",
+        "NUMERIC",
+    )
+    try:
+        with pytest.raises(ResponseError, match="already exists"):
+            _create(adapter)
+        # The half-created collection (meta, but no index) is not reported as existing.
+        assert adapter.collection_exists() is False
+    finally:
+        adapter._client.execute_command("FT.DROPINDEX", ft_name)
+        adapter._client.delete(f"ovvec-meta:{adapter.collection_name}")

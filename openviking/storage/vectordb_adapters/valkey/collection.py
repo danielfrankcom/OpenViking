@@ -237,22 +237,52 @@ class ValkeyCollection(ICollection):
             str(len(vector_args)),
             *vector_args,
         ]
+        expected_attributes = {ALL_FIELD, self._vector_field}
         for field in index_meta.get("ScalarIndex") or []:
             if field not in self._fields_dict:
                 raise ValueError(f"ScalarIndex field {field!r} is not in the collection schema")
-            schema += self._schema_args(field, self._fields_dict[field]["FieldType"])
-        self._client.execute_command(
-            "FT.CREATE",
-            self._ft_name(index_name),
-            "ON",
-            "HASH",
-            "PREFIX",
-            "1",
-            self._key(""),
-            "SCHEMA",
-            *schema,
-        )
+            field_type = self._fields_dict[field]["FieldType"]
+            schema += self._schema_args(field, field_type)
+            expected_attributes.update(self._attribute_names(field, field_type))
+        # redis is an optional dependency; this module is imported even without it.
+        from redis.exceptions import ResponseError
+
+        try:
+            self._client.execute_command(
+                "FT.CREATE",
+                self._ft_name(index_name),
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                self._key(""),
+                "SCHEMA",
+                *schema,
+            )
+        except ResponseError as error:
+            # FT.CREATE is not idempotent, and two callers can legitimately send it for
+            # the same index: redis-py resends a command that hit the client-side socket
+            # timeout while the server was still creating the index, and several
+            # OpenViking processes can start against an empty deployment at once. Accept
+            # an existing index only if it has this collection's prefix and attributes.
+            if "already exists" not in str(error):
+                raise
+            if not self._ft_index_matches(index_name, expected_attributes):
+                raise
         self._wait_for_backfill(index_name)
+
+    def _ft_index_matches(self, index_name: str, expected_attributes: Set[str]) -> bool:
+        # Compares the key prefix and the attribute names only, not the attribute types
+        # or the vector dimension and metric: enough to tell this collection's index
+        # from another one, which is the case this guards against.
+        info = _as_dict(self._client.execute_command("FT.INFO", self._ft_name(index_name)))
+        definition = _as_dict(info.get("index_definition") or [])
+        prefixes = [_text(prefix) for prefix in definition.get("prefixes") or []]
+        identifiers = {
+            _text(_as_dict(attribute).get("identifier", ""))
+            for attribute in info.get("attributes") or []
+        }
+        return prefixes == [self._key("")] and identifiers == expected_attributes
 
     @staticmethod
     def _schema_args(field: str, field_type: str) -> List[str]:
@@ -266,6 +296,13 @@ class ValkeyCollection(ICollection):
         raise NotImplementedError(
             f"Valkey vector backend cannot index {field_type} field {field!r}"
         )
+
+    @staticmethod
+    def _attribute_names(field: str, field_type: str) -> List[str]:
+        """The FT attribute names that ``_schema_args`` creates for ``field``."""
+        if field_type == PATH_TYPE:
+            return [field, ancestors_field(field), depth_field(field)]
+        return [field]
 
     def _wait_for_backfill(self, index_name: str) -> None:
         # An index created over existing keys is filled by a background scan; wait so
