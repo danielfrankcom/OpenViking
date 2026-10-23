@@ -234,3 +234,14 @@ def test_create_rejects_existing_ft_index_with_other_schema(make_valkey_adapter)
     finally:
         adapter._client.execute_command("FT.DROPINDEX", ft_name)
         adapter._client.delete(f"ovvec-meta:{adapter.collection_name}")
+
+
+def test_cluster_clients_spread_their_default_node(make_valkey_adapter, valkey_params):
+    if valkey_params["mode"] != "cluster":
+        pytest.skip("only cluster clients have a default node")
+    adapters = [make_valkey_adapter() for _ in range(20)]
+    primaries = {node.name for node in adapters[0]._client.get_primaries()}
+    default_nodes = {adapter._client.get_default_node().name for adapter in adapters}
+    assert default_nodes <= primaries
+    # 20 clients all choosing one of 3 primaries by chance has probability 3 / 3**20.
+    assert len(default_nodes) > 1

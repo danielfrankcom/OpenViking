@@ -13,6 +13,7 @@ Driver: redis-py.
 from __future__ import annotations
 
 import os
+import random
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
@@ -89,7 +90,13 @@ def _connect(config: ValkeyConfig) -> tuple[Any, list[Any]]:
 
     if config.mode == "cluster":
         nodes = [ClusterNode(host, port) for host, port in addresses]
-        return RedisCluster(startup_nodes=nodes, **options), []
+        client = RedisCluster(startup_nodes=nodes, **options)
+        # redis-py sends every keyless command (all FT.* commands) to one default node,
+        # the first primary. With the coordinator any primary can serve them, so pick
+        # one at random per client: otherwise every OpenViking process coordinates all
+        # of its searches and index DDL on the same node.
+        client.set_default_node(random.choice(client.get_primaries()))
+        return client, []
 
     if config.mode == "sentinel":
         sentinel_password = _secret(
